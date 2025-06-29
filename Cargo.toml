@@ -1,0 +1,20 @@
+[package]
+name = "rnotes"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A terminal-based markdown notes manager with VIM-like interface"
+authors = ["Rafael"]
+repository = "https://github.com/your-username/rnotes"
+keywords = ["markdown", "notes", "terminal", "vim", "tui"]
+categories = ["command-line-utilities", "text-editors"]
+
+[dependencies]
+ratatui = "0.26"
+crossterm = "0.27"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+arboard = "3.4"
