@@ -47,6 +47,14 @@ impl FileTree {
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
                 let path = entry.path();
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                
+                // Filter out .git directory and other hidden directories/files starting with .
+                if file_name.starts_with('.') {
+                    return false;
+                }
+                
+                // Only show directories or markdown files
                 path.is_dir() || path.extension().and_then(|s| s.to_str()) == Some("md")
             })
             .collect();

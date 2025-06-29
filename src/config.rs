@@ -2,10 +2,14 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub root_directory: PathBuf,
     pub editor: String,
+    pub git_enabled: bool,
+    pub git_repository: Option<String>,
+    pub git_username: Option<String>,
+    pub git_email: Option<String>,
 }
 
 impl Default for Config {
@@ -16,6 +20,10 @@ impl Default for Config {
         Self {
             root_directory,
             editor: "vim".to_string(),
+            git_enabled: false,
+            git_repository: None,
+            git_username: None,
+            git_email: None,
         }
     }
 }

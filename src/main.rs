@@ -20,9 +20,11 @@ use std::{
 
 mod config;
 mod file_tree;
+mod git;
 
 use config::Config;
 use file_tree::FileTree;
+use git::GitManager;
 
 #[derive(Debug, Clone, PartialEq)]
 enum AppMode {
@@ -40,26 +42,40 @@ pub struct App {
     current_file: Option<PathBuf>,
     mode: AppMode,
     config_input: String,
-    config_field: usize, // 0 = root_dir, 1 = editor
+    config_field: usize, // 0 = root_dir, 1 = editor, 2 = git_enabled, 3 = git_repo, 4 = git_username, 5 = git_email
     rename_input: String,
     delete_target: Option<PathBuf>,
     // Line navigation fields
     content_lines: Vec<String>,
     line_selection: usize,
     should_quit: bool,
+    git_manager: GitManager,
 }
 
 impl App {
     pub fn new() -> Result<App> {
         let config = Config::load_or_create()?;
         let file_tree = FileTree::new(&config.root_directory)?;
+        let git_manager = GitManager::new(config.clone());
+        
+        // Initialize Git repository if enabled
+        if config.git_enabled {
+            if let Err(e) = git_manager.init_repository() {
+                eprintln!("Warning: Failed to initialize Git repository: {}", e);
+            } else {
+                // Perform initial git pull to sync with remote (quiet mode)
+                if let Err(e) = git_manager.pull_changes_with_feedback(false) {
+                    eprintln!("Warning: Failed to pull initial changes: {}", e);
+                }
+            }
+        }
         
         // Create welcome file if it doesn't exist
         let welcome_path = config.root_directory.join("welcome.md");
         if !welcome_path.exists() {
             fs::write(
                 &welcome_path,
-                "# Welcome to RNotes!\n\nThis is your markdown notes manager.\n\n## Features:\n- Navigate through markdown files\n- Edit files with your preferred editor\n- VIM-like interface\n\n## Usage:\n- Use arrow keys or j/k to navigate\n- Press Enter to edit a file\n- Press 'n' to create a new file\n- Press 'c' to open configuration\n- Press 'q' to quit\n\nHappy note-taking!",
+                "# Welcome to RNotes!\n\nThis is your markdown notes manager.\n\n## Features:\n- Navigate through markdown files\n- Edit files with your preferred editor\n- VIM-like interface\n- Git integration for syncing notes\n\n## Usage:\n- Use arrow keys or j/k to navigate\n- Press Enter to edit a file\n- Press 'n' to create a new file\n- Press 'c' to open configuration\n- Press 'q' to quit\n- Press 'g' for Git operations\n\nHappy note-taking!",
             )?;
         }
 
@@ -76,6 +92,7 @@ impl App {
             content_lines: Vec::new(),
             line_selection: 0,
             should_quit: false,
+            git_manager,
         };
         
         // Load the first file's content automatically
@@ -145,6 +162,14 @@ impl App {
                 self.config_input = self.config.root_directory.to_string_lossy().to_string();
                 self.config_field = 0;
             }
+            KeyCode::Char('g') => {
+                // Git push (commit and push changes)
+                self.perform_git_push()?;
+            }
+            KeyCode::Char('p') => {
+                // Git pull changes
+                self.perform_git_pull()?;
+            }
             _ => {}
         }
         Ok(())
@@ -157,40 +182,43 @@ impl App {
                 self.config_input.clear();
             }
             KeyCode::Tab => {
-                if self.config_field == 0 {
-                    // Save root directory and move to editor field
-                    if let Ok(path) = PathBuf::from(&self.config_input).canonicalize() {
-                        self.config.root_directory = path;
-                    }
-                    self.config_field = 1;
-                    self.config_input = self.config.editor.clone();
-                } else {
-                    // Save editor and go back to root directory
-                    self.config.editor = self.config_input.clone();
-                    self.config_field = 0;
-                    self.config_input = self.config.root_directory.to_string_lossy().to_string();
-                }
+                self.save_current_config_field();
+                self.config_field = (self.config_field + 1) % 6; // Now 6 fields total
+                self.load_current_config_field();
             }
             KeyCode::Enter => {
                 // Save current field and exit config mode
-                if self.config_field == 0 {
-                    if let Ok(path) = PathBuf::from(&self.config_input).canonicalize() {
-                        self.config.root_directory = path;
-                    }
-                } else {
-                    self.config.editor = self.config_input.clone();
-                }
+                self.save_current_config_field();
                 
                 self.config.save()?;
+                
+                // Update git manager with new config
+                self.git_manager = GitManager::new(self.config.clone());
+                
+                // Initialize Git repository if enabled
+                if self.config.git_enabled {
+                    if let Err(e) = self.git_manager.init_repository() {
+                        eprintln!("Warning: Failed to initialize Git repository: {}", e);
+                    }
+                }
+                
                 self.file_tree = FileTree::new(&self.config.root_directory)?;
                 self.mode = AppMode::Normal;
                 self.config_input.clear();
             }
             KeyCode::Char(c) => {
-                self.config_input.push(c);
+                if self.config_field == 2 { // Git enabled field
+                    // For boolean field, toggle on any character input
+                    self.config.git_enabled = !self.config.git_enabled;
+                    self.config_input = self.config.git_enabled.to_string();
+                } else {
+                    self.config_input.push(c);
+                }
             }
             KeyCode::Backspace => {
-                self.config_input.pop();
+                if self.config_field != 2 { // Don't allow backspace on boolean field
+                    self.config_input.pop();
+                }
             }
             _ => {}
         }
@@ -243,6 +271,7 @@ impl App {
 
     fn perform_rename(&mut self) -> Result<()> {
         if let Some(current_path) = self.file_tree.get_selected_path() {
+            let current_path = current_path.clone(); // Clone to avoid borrow issues
             if !self.rename_input.is_empty() {
                 // Save current tree state
                 let expanded_dirs = self.file_tree.get_expansion_state();
@@ -265,10 +294,10 @@ impl App {
                 let new_path = parent.join(&new_filename);
                 
                 if !new_path.exists() {
-                    fs::rename(current_path, &new_path)?;
+                    fs::rename(&current_path, &new_path)?;
                     
                     // Update current_file if it was the renamed item
-                    if Some(current_path) == self.current_file.as_ref() {
+                    if Some(&current_path) == self.current_file.as_ref() {
                         if new_path.is_file() {
                             self.current_file = Some(new_path.clone());
                             self.load_current_file_content()?;
@@ -453,20 +482,21 @@ impl App {
 
     fn perform_delete(&mut self) -> Result<()> {
         if let Some(target_path) = &self.delete_target {
+            let target_path = target_path.clone(); // Clone to avoid borrow issues
             // Save current tree state
             let expanded_dirs = self.file_tree.get_expansion_state();
             let parent_dir = target_path.parent();
             
             if target_path.is_dir() {
                 // For directories, remove recursively
-                std::fs::remove_dir_all(target_path)?;
+                std::fs::remove_dir_all(&target_path)?;
             } else {
                 // For files, remove the file
-                std::fs::remove_file(target_path)?;
+                std::fs::remove_file(&target_path)?;
             }
             
             // If we deleted the currently viewed file, clear the content
-            if Some(target_path) == self.current_file.as_ref() {
+            if Some(&target_path) == self.current_file.as_ref() {
                 self.current_file = None;
                 self.current_content.clear();
             }
@@ -542,6 +572,88 @@ impl App {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn save_current_config_field(&mut self) {
+        match self.config_field {
+            0 => {
+                if let Ok(path) = PathBuf::from(&self.config_input).canonicalize() {
+                    self.config.root_directory = path;
+                }
+            }
+            1 => {
+                self.config.editor = self.config_input.clone();
+            }
+            2 => {
+                // Git enabled is handled in the input handler
+            }
+            3 => {
+                if self.config_input.trim().is_empty() {
+                    self.config.git_repository = None;
+                } else {
+                    self.config.git_repository = Some(self.config_input.clone());
+                }
+            }
+            4 => {
+                if self.config_input.trim().is_empty() {
+                    self.config.git_username = None;
+                } else {
+                    self.config.git_username = Some(self.config_input.clone());
+                }
+            }
+            5 => {
+                if self.config_input.trim().is_empty() {
+                    self.config.git_email = None;
+                } else {
+                    self.config.git_email = Some(self.config_input.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn load_current_config_field(&mut self) {
+        self.config_input = match self.config_field {
+            0 => self.config.root_directory.to_string_lossy().to_string(),
+            1 => self.config.editor.clone(),
+            2 => self.config.git_enabled.to_string(),
+            3 => self.config.git_repository.clone().unwrap_or_default(),
+            4 => self.config.git_username.clone().unwrap_or_default(),
+            5 => self.config.git_email.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+    }
+
+    fn perform_git_push(&mut self) -> Result<()> {
+        if !self.config.git_enabled {
+            return Ok(());
+        }
+
+        // Commit current changes and push
+        if let Err(e) = self.git_manager.commit_and_push() {
+            eprintln!("Git push failed: {}", e);
+        }
+
+        Ok(())
+    }
+
+    fn perform_git_pull(&mut self) -> Result<()> {
+        if !self.config.git_enabled {
+            return Ok(());
+        }
+
+        // Pull changes from remote
+        if let Err(e) = self.git_manager.pull_changes() {
+            eprintln!("Git pull failed: {}", e);
+        } else {
+            // Refresh the file tree after pulling changes
+            let expanded_dirs = self.file_tree.get_expansion_state();
+            let selected_path = self.file_tree.get_selected_path().map(|p| p.clone());
+            self.file_tree.refresh_with_state(expanded_dirs, selected_path)?;
+            self.load_current_file_content()?;
+        }
+
         Ok(())
     }
 
@@ -623,10 +735,14 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(1),
+                Constraint::Length(3), // Title
+                Constraint::Length(3), // Root directory
+                Constraint::Length(3), // Editor
+                Constraint::Length(3), // Git enabled
+                Constraint::Length(3), // Git repository
+                Constraint::Length(3), // Git username
+                Constraint::Length(3), // Git email
+                Constraint::Min(1),    // Help
             ])
             .split(area);
 
@@ -642,13 +758,11 @@ impl App {
         } else {
             Style::default()
         };
-        
         let root_dir_content = if self.config_field == 0 {
             self.config_input.as_str()
         } else {
             &self.config.root_directory.to_string_lossy()
         };
-        
         let root_dir = Paragraph::new(root_dir_content)
             .block(Block::default().title("Root Directory").borders(Borders::ALL))
             .style(root_dir_style);
@@ -660,23 +774,85 @@ impl App {
         } else {
             Style::default()
         };
-        
         let editor_content = if self.config_field == 1 {
             self.config_input.as_str()
         } else {
             self.config.editor.as_str()
         };
-        
         let editor = Paragraph::new(editor_content)
             .block(Block::default().title("Editor").borders(Borders::ALL))
             .style(editor_style);
         f.render_widget(editor, chunks[2]);
 
+        // Git enabled field
+        let git_enabled_style = if self.config_field == 2 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let git_enabled_content = if self.config_field == 2 {
+            self.config_input.as_str()
+        } else {
+            if self.config.git_enabled { "true" } else { "false" }
+        };
+        let git_enabled = Paragraph::new(git_enabled_content)
+            .block(Block::default().title("Git Enabled (any key to toggle)").borders(Borders::ALL))
+            .style(git_enabled_style);
+        f.render_widget(git_enabled, chunks[3]);
+
+        // Git repository field
+        let git_repo_style = if self.config_field == 3 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let git_repo_content = if self.config_field == 3 {
+            self.config_input.as_str()
+        } else {
+            self.config.git_repository.as_deref().unwrap_or("")
+        };
+        let git_repo = Paragraph::new(git_repo_content)
+            .block(Block::default().title("Git Repository URL").borders(Borders::ALL))
+            .style(git_repo_style);
+        f.render_widget(git_repo, chunks[4]);
+
+        // Git username field
+        let git_username_style = if self.config_field == 4 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let git_username_content = if self.config_field == 4 {
+            self.config_input.as_str()
+        } else {
+            self.config.git_username.as_deref().unwrap_or("")
+        };
+        let git_username = Paragraph::new(git_username_content)
+            .block(Block::default().title("Git Username").borders(Borders::ALL))
+            .style(git_username_style);
+        f.render_widget(git_username, chunks[5]);
+
+        // Git email field
+        let git_email_style = if self.config_field == 5 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let git_email_content = if self.config_field == 5 {
+            self.config_input.as_str()
+        } else {
+            self.config.git_email.as_deref().unwrap_or("")
+        };
+        let git_email = Paragraph::new(git_email_content)
+            .block(Block::default().title("Git Email").borders(Borders::ALL))
+            .style(git_email_style);
+        f.render_widget(git_email, chunks[6]);
+
         // Help text
         let help = Paragraph::new("Tab: Next field | Enter: Save & Exit | Esc: Cancel")
             .block(Block::default().borders(Borders::ALL))
             .style(Style::default().fg(Color::Gray));
-        f.render_widget(help, chunks[3]);
+        f.render_widget(help, chunks[7]);
     }
 
     fn render_top_bar(&self, f: &mut Frame, area: Rect) {
@@ -703,7 +879,25 @@ impl App {
         };
         
         let root_dir = self.config.root_directory.to_string_lossy();
-        let status_line = format!(" RNotes - {} | Current: {} | Root: {} ", current_file_name, current_context, root_dir);
+        
+        // Add Git status if enabled
+        let git_status = if self.config.git_enabled {
+            match self.git_manager.get_status() {
+                Ok(status) => {
+                    if status.has_changes() {
+                        format!(" | Git: {} changes", status.modified + status.untracked)
+                    } else {
+                        " | Git: ✓".to_string()
+                    }
+                }
+                Err(_) => " | Git: ⚠".to_string(),
+            }
+        } else {
+            String::new()
+        };
+        
+        let status_line = format!(" RNotes - {} | Current: {} | Root: {}{} ", 
+                                current_file_name, current_context, root_dir, git_status);
         
         let paragraph = Paragraph::new(status_line.as_str())
             .style(Style::default().bg(Color::Blue).fg(Color::White));
@@ -713,7 +907,13 @@ impl App {
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
         let footer_text = match self.mode {
-            AppMode::Normal => " j/k:Navigate | Space/→:Expand/Lines | i:Edit | n:New | r:Rename | x:Delete | d:Folder | c:Config | q:Quit ",
+            AppMode::Normal => {
+                if self.config.git_enabled {
+                    " j/k:Navigate | Space/→:Expand/Lines | i:Edit | n:New | r:Rename | x:Delete | d:Folder | c:Config | g:Push | p:Pull | q:Quit "
+                } else {
+                    " j/k:Navigate | Space/→:Expand/Lines | i:Edit | n:New | r:Rename | x:Delete | d:Folder | c:Config | q:Quit "
+                }
+            }
             AppMode::Config => " Tab:Next field | Enter:Save | Esc:Cancel ",
             AppMode::Rename => " Type new name | Enter:Confirm | Esc:Cancel ",
             AppMode::DeleteConfirm => " y:Yes, delete | n:No, cancel | Esc:Cancel ",
