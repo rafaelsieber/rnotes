@@ -16,7 +16,7 @@ A fast, terminal-based markdown notes manager with VIM-like keybindings and intu
 
 ### From Source
 ```bash
-git clone https://github.com/your-username/rnotes.git
+git clone https://github.com/rafaelsieber/rnotes.git
 cd rnotes
 cargo build --release
 ./target/release/rnotes

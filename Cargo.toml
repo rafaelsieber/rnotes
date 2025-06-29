@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "A terminal-based markdown notes manager with VIM-like interface"
 authors = ["Rafael"]
-repository = "https://github.com/your-username/rnotes"
+repository = "https://github.com/rafaelsieber/rnotes"
 keywords = ["markdown", "notes", "terminal", "vim", "tui"]
 categories = ["command-line-utilities", "text-editors"]
 
