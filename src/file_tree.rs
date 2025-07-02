@@ -54,8 +54,24 @@ impl FileTree {
                     return false;
                 }
                 
-                // Only show directories or markdown files
-                path.is_dir() || path.extension().and_then(|s| s.to_str()) == Some("md")
+                // Show directories, markdown files, and image files
+                if path.is_dir() {
+                    return true;
+                }
+                
+                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    let ext_lower = ext.to_lowercase();
+                    return ext_lower == "md" || 
+                           ext_lower == "png" || 
+                           ext_lower == "jpg" || 
+                           ext_lower == "jpeg" || 
+                           ext_lower == "gif" || 
+                           ext_lower == "bmp" || 
+                           ext_lower == "webp" || 
+                           ext_lower == "svg";
+                }
+                
+                false
             })
             .collect();
 
@@ -233,5 +249,19 @@ impl FileTree {
         }
         
         Ok(())
+    }
+    
+    pub fn is_image_file(path: &PathBuf) -> bool {
+        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            let ext_lower = ext.to_lowercase();
+            return ext_lower == "png" || 
+                   ext_lower == "jpg" || 
+                   ext_lower == "jpeg" || 
+                   ext_lower == "gif" || 
+                   ext_lower == "bmp" || 
+                   ext_lower == "webp" || 
+                   ext_lower == "svg";
+        }
+        false
     }
 }

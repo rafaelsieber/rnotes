@@ -1,9 +1,11 @@
 use anyhow::Result;
+use arboard::Clipboard;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType},
 };
+use image::DynamicImage;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
@@ -12,6 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
 use std::{
     fs,
     io,
@@ -55,6 +58,10 @@ pub struct App {
     should_quit: bool,
     git_manager: GitManager,
     markdown_renderer: MarkdownRenderer,
+    // Image handling fields
+    current_image: Option<DynamicImage>,
+    image_picker: Option<Picker>,
+    image_state: Option<Box<dyn StatefulProtocol>>,
 }
 
 impl App {
@@ -100,6 +107,9 @@ impl App {
             should_quit: false,
             git_manager,
             markdown_renderer: MarkdownRenderer::new(),
+            current_image: None,
+            image_picker: None,
+            image_state: None,
         };
         
         // Load the first file's content automatically
@@ -150,10 +160,11 @@ impl App {
                     if selected_path.is_dir() {
                         // Toggle folder expansion/collapse
                         self.file_tree.toggle_selected()?;
-                    } else {
-                        // Enter line navigation mode if a file is selected
+                    } else if !FileTree::is_image_file(&selected_path) {
+                        // Enter line navigation mode only for non-image files
                         self.enter_line_navigation_mode()?;
                     }
+                    // Do nothing for image files - navigation is disabled
                 } else {
                     // If nothing selected, try to toggle
                     self.file_tree.toggle_selected()?;
@@ -176,6 +187,10 @@ impl App {
             KeyCode::Char('p') => {
                 // Git pull changes
                 self.perform_git_pull()?;
+            }
+            KeyCode::Char('y') => {
+                // Copy image to clipboard if current selection is an image
+                self.copy_image_to_clipboard()?;
             }
             _ => {}
         }
@@ -325,7 +340,40 @@ impl App {
     fn load_current_file_content(&mut self) -> Result<()> {
         if let Some(file_path) = self.file_tree.get_selected_file() {
             self.current_file = Some(file_path.clone());
-            if file_path.extension().and_then(|s| s.to_str()) == Some("md") {
+            
+            // Check if it's an image file
+            if FileTree::is_image_file(&file_path) {
+                // Load image
+                match image::open(&file_path) {
+                    Ok(img) => {
+                        self.current_image = Some(img);
+                        // Initialize image picker if not already done
+                        if self.image_picker.is_none() {
+                            self.image_picker = Some(Picker::from_termios().unwrap_or_else(|_| Picker::new((14, 8))));
+                        }
+                        if let Some(picker) = &mut self.image_picker {
+                            let image_state = picker.new_resize_protocol(self.current_image.as_ref().unwrap().clone());
+                            self.image_state = Some(image_state);
+                        }
+                        self.current_content = format!("Image: {}", file_path.display());
+                        self.content_lines = vec![format!("Image: {}", file_path.display())];
+                        self.rendered_lines = vec![Line::from(format!("Image: {}", file_path.display()))];
+                        self.line_selection = 0;
+                    },
+                    Err(e) => {
+                        self.current_image = None;
+                        self.image_state = None;
+                        self.current_content = format!("Error loading image: {}", e);
+                        self.content_lines = vec![format!("Error loading image: {}", e)];
+                        self.rendered_lines = vec![Line::from(format!("Error loading image: {}", e))];
+                        self.line_selection = 0;
+                    }
+                }
+            } else if file_path.extension().and_then(|s| s.to_str()) == Some("md") {
+                // Clear image data when loading non-image files
+                self.current_image = None;
+                self.image_state = None;
+                
                 match fs::read_to_string(&file_path) {
                     Ok(content) => {
                         self.current_content = content.clone();
@@ -355,12 +403,19 @@ impl App {
                     }
                 }
             } else {
+                // Clear image data for other file types
+                self.current_image = None;
+                self.image_state = None;
+                
                 self.current_content = "Not a markdown file".to_string();
                 self.content_lines = vec!["Not a markdown file".to_string()];
                 self.rendered_lines = vec![Line::from("Not a markdown file".to_string())];
                 self.line_selection = 0;
             }
         } else {
+            // Clear all content when no file is selected
+            self.current_image = None;
+            self.image_state = None;
             self.current_content.clear();
             self.content_lines.clear();
             self.rendered_lines.clear();
@@ -600,6 +655,22 @@ impl App {
         Ok(())
     }
 
+    fn copy_image_to_clipboard(&mut self) -> Result<()> {
+        if let Some(selected_path) = self.file_tree.get_selected_path() {
+            if FileTree::is_image_file(&selected_path) {
+                // Copy image file path to clipboard (or could copy image data)
+                let mut clipboard = Clipboard::new()?;
+                let image_path = selected_path.to_string_lossy().to_string();
+                clipboard.set_text(image_path)?;
+                
+                // Could also copy the actual image data, but for now we'll copy the path
+                // For copying actual image data, you'd need to read the image and convert it
+                // to a format the clipboard can handle
+            }
+        }
+        Ok(())
+    }
+
     fn save_current_config_field(&mut self) {
         match self.config_field {
             0 => {
@@ -721,6 +792,11 @@ impl App {
                     } else if item.ends_with(".md") {
                         // Markdown file
                         Style::default().fg(Color::Green)
+                    } else if item.ends_with(".png") || item.ends_with(".jpg") || item.ends_with(".jpeg") || 
+                             item.ends_with(".gif") || item.ends_with(".bmp") || item.ends_with(".webp") || 
+                             item.ends_with(".svg") {
+                        // Image file
+                        Style::default().fg(Color::Magenta)
                     } else {
                         // Other files
                         Style::default().fg(Color::Gray)
@@ -743,9 +819,21 @@ impl App {
                 "Content".to_string()
             };
 
-            // Use markdown rendering for .md files, plain text for others
+            // Check what type of content to render
             if let Some(file_path) = &self.current_file {
-                if file_path.extension().and_then(|s| s.to_str()) == Some("md") && !self.current_content.is_empty() {
+                if FileTree::is_image_file(file_path) && self.current_image.is_some() && self.image_state.is_some() {
+                    // Render image
+                    if let Some(ref mut state) = self.image_state {
+                        // Render a block for the image area first
+                        let block = Block::default().title(title.as_str()).borders(Borders::ALL);
+                        let inner = block.inner(chunks[1]);
+                        f.render_widget(block, chunks[1]);
+                        
+                        // Then render the image inside
+                        let image_widget = StatefulImage::new(None);
+                        f.render_stateful_widget(image_widget, inner, state);
+                    }
+                } else if file_path.extension().and_then(|s| s.to_str()) == Some("md") && !self.current_content.is_empty() {
                     // Parse and render markdown
                     match self.markdown_renderer.parse_markdown(&self.current_content) {
                         Ok(elements) => {
@@ -963,10 +1051,23 @@ impl App {
     fn render_footer(&self, f: &mut Frame, area: Rect) {
         let footer_text = match self.mode {
             AppMode::Normal => {
+                // Check if current selection is an image to show appropriate help
+                let is_image = self.file_tree.get_selected_path()
+                    .map(|p| FileTree::is_image_file(&p))
+                    .unwrap_or(false);
+                
                 if self.config.git_enabled {
-                    " j/k:Navigate | Space/→:Expand/Lines | i:Edit | n:New | r:Rename | x:Delete | d:Folder | c:Config | g:Push | p:Pull | q:Quit "
+                    if is_image {
+                        " j/k:Navigate | y:Copy to clipboard | i:Edit | n:New | r:Rename | x:Delete | d:Folder | c:Config | g:Push | p:Pull | q:Quit "
+                    } else {
+                        " j/k:Navigate | Space/→:Expand/Lines | i:Edit | n:New | r:Rename | x:Delete | d:Folder | c:Config | g:Push | p:Pull | q:Quit "
+                    }
                 } else {
-                    " j/k:Navigate | Space/→:Expand/Lines | i:Edit | n:New | r:Rename | x:Delete | d:Folder | c:Config | q:Quit "
+                    if is_image {
+                        " j/k:Navigate | y:Copy to clipboard | i:Edit | n:New | r:Rename | x:Delete | d:Folder | c:Config | q:Quit "
+                    } else {
+                        " j/k:Navigate | Space/→:Expand/Lines | i:Edit | n:New | r:Rename | x:Delete | d:Folder | c:Config | q:Quit "
+                    }
                 }
             }
             AppMode::Config => " Tab:Next field | Enter:Save | Esc:Cancel ",
