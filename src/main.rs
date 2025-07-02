@@ -8,6 +8,7 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
@@ -21,10 +22,12 @@ use std::{
 mod config;
 mod file_tree;
 mod git;
+mod markdown;
 
 use config::Config;
 use file_tree::FileTree;
 use git::GitManager;
+use markdown::MarkdownRenderer;
 
 #[derive(Debug, Clone, PartialEq)]
 enum AppMode {
@@ -47,9 +50,11 @@ pub struct App {
     delete_target: Option<PathBuf>,
     // Line navigation fields
     content_lines: Vec<String>,
+    rendered_lines: Vec<ratatui::text::Line<'static>>, // For formatted line navigation
     line_selection: usize,
     should_quit: bool,
     git_manager: GitManager,
+    markdown_renderer: MarkdownRenderer,
 }
 
 impl App {
@@ -90,9 +95,11 @@ impl App {
             rename_input: String::new(),
             delete_target: None,
             content_lines: Vec::new(),
+            rendered_lines: Vec::new(),
             line_selection: 0,
             should_quit: false,
             git_manager,
+            markdown_renderer: MarkdownRenderer::new(),
         };
         
         // Load the first file's content automatically
@@ -323,22 +330,40 @@ impl App {
                     Ok(content) => {
                         self.current_content = content.clone();
                         self.content_lines = content.lines().map(|s| s.to_string()).collect();
+                        
+                        // Generate formatted lines for line navigation
+                        match self.markdown_renderer.parse_markdown(&content) {
+                            Ok(elements) => {
+                                let rendered_text = self.markdown_renderer.render_to_text(&elements);
+                                self.rendered_lines = rendered_text.lines.into_iter().collect();
+                            }
+                            Err(_) => {
+                                // Fallback to plain text lines
+                                self.rendered_lines = self.content_lines.iter()
+                                    .map(|line| Line::from(line.clone()))
+                                    .collect();
+                            }
+                        }
+                        
                         self.line_selection = 0;
                     },
                     Err(_) => {
                         self.current_content = "Error reading file".to_string();
                         self.content_lines = vec!["Error reading file".to_string()];
+                        self.rendered_lines = vec![Line::from("Error reading file".to_string())];
                         self.line_selection = 0;
                     }
                 }
             } else {
                 self.current_content = "Not a markdown file".to_string();
                 self.content_lines = vec!["Not a markdown file".to_string()];
+                self.rendered_lines = vec![Line::from("Not a markdown file".to_string())];
                 self.line_selection = 0;
             }
         } else {
             self.current_content.clear();
             self.content_lines.clear();
+            self.rendered_lines.clear();
             self.current_file = None;
             self.line_selection = 0;
         }
@@ -520,7 +545,7 @@ impl App {
                 self.mode = AppMode::Normal;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.line_selection < self.content_lines.len().saturating_sub(1) {
+                if self.line_selection < self.rendered_lines.len().saturating_sub(1) {
                     self.line_selection += 1;
                 }
             }
@@ -544,7 +569,7 @@ impl App {
 
     fn enter_line_navigation_mode(&mut self) -> Result<()> {
         if self.current_file.is_some() && !self.current_content.is_empty() {
-            self.content_lines = self.current_content.lines().map(|s| s.to_string()).collect();
+            // Use the pre-processed lines (content_lines for plain text copy, rendered_lines for display)
             self.line_selection = 0;
             self.mode = AppMode::LineNavigation;
         }
@@ -718,11 +743,41 @@ impl App {
                 "Content".to_string()
             };
 
-            let paragraph = Paragraph::new(self.current_content.as_str())
-                .block(Block::default().title(title.as_str()).borders(Borders::ALL))
-                .wrap(Wrap { trim: true });
-
-            f.render_widget(paragraph, chunks[1]);
+            // Use markdown rendering for .md files, plain text for others
+            if let Some(file_path) = &self.current_file {
+                if file_path.extension().and_then(|s| s.to_str()) == Some("md") && !self.current_content.is_empty() {
+                    // Parse and render markdown
+                    match self.markdown_renderer.parse_markdown(&self.current_content) {
+                        Ok(elements) => {
+                            let rendered_text = self.markdown_renderer.render_to_text(&elements);
+                            let paragraph = Paragraph::new(rendered_text)
+                                .block(Block::default().title(title.as_str()).borders(Borders::ALL))
+                                .wrap(Wrap { trim: true })
+                                .scroll((0, 0));
+                            f.render_widget(paragraph, chunks[1]);
+                        }
+                        Err(_) => {
+                            // Fallback to plain text if markdown parsing fails
+                            let paragraph = Paragraph::new(self.current_content.as_str())
+                                .block(Block::default().title(title.as_str()).borders(Borders::ALL))
+                                .wrap(Wrap { trim: true });
+                            f.render_widget(paragraph, chunks[1]);
+                        }
+                    }
+                } else {
+                    // Plain text rendering for non-markdown files
+                    let paragraph = Paragraph::new(self.current_content.as_str())
+                        .block(Block::default().title(title.as_str()).borders(Borders::ALL))
+                        .wrap(Wrap { trim: true });
+                    f.render_widget(paragraph, chunks[1]);
+                }
+            } else {
+                // No file selected
+                let paragraph = Paragraph::new("No file selected")
+                    .block(Block::default().title("Content").borders(Borders::ALL))
+                    .style(Style::default().fg(Color::Gray));
+                f.render_widget(paragraph, chunks[1]);
+            }
         }
 
         // Render footer
@@ -1024,31 +1079,50 @@ impl App {
 
         f.render_stateful_widget(list, chunks[0], self.file_tree.get_state_mut());
         
-        // Render content with line navigation
+        // Render content with line navigation using formatted lines
         let title = if let Some(file_path) = &self.current_file {
             format!("Line Navigation - {}", file_path.file_name().unwrap().to_string_lossy())
         } else {
             "Line Navigation".to_string()
         };
 
-        // Create line items with highlighting
-        let line_items: Vec<ListItem> = self.content_lines
+        // Create line items with highlighting using rendered/formatted lines
+        let line_items: Vec<ListItem> = self.rendered_lines
             .iter()
             .enumerate()
             .map(|(i, line)| {
-                let style = if i == self.line_selection {
-                    Style::default().bg(Color::Blue).fg(Color::White)
+                let base_style = if i == self.line_selection {
+                    Style::default().bg(Color::Blue)
                 } else {
                     Style::default()
                 };
-                ListItem::new(format!("{:3}: {}", i + 1, line)).style(style)
+                
+                // Create a line with line number and preserve the formatting
+                let line_number = format!("{:3}: ", i + 1);
+                let mut spans = vec![Span::styled(
+                    line_number,
+                    Style::default().fg(Color::DarkGray),
+                )];
+                
+                // Add the formatted line spans
+                spans.extend(line.spans.iter().cloned());
+                
+                // Apply selection highlighting if needed
+                if i == self.line_selection {
+                    // Apply background color to all spans
+                    for span in &mut spans {
+                        span.style = span.style.bg(Color::Blue);
+                    }
+                }
+                
+                ListItem::new(Line::from(spans)).style(base_style)
             })
             .collect();
 
         let line_list = List::new(line_items)
             .block(Block::default().title(title.as_str()).borders(Borders::ALL))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .highlight_symbol(">> ");
+            .highlight_style(Style::default()) // Don't override our custom highlighting
+            .highlight_symbol(""); // Remove default highlight symbol since we're doing custom highlighting
 
         // Create a list state for line navigation
         let mut line_state = ratatui::widgets::ListState::default();
